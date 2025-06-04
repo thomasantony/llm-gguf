@@ -1,6 +1,7 @@
 import click
 import httpx
 import json
+import re
 from llama_cpp import Llama
 from llama_cpp import llama_chat_format
 import llm
@@ -210,6 +211,7 @@ def register_commands(cli):
 
 class GgufChatModel(llm.Model):
     can_stream = True
+    supports_tools = True
 
     def __init__(
         self,
@@ -229,11 +231,12 @@ class GgufChatModel(llm.Model):
     def get_model(self):
         if self._model is None:
             if self.chat_handler_class is None:
+                # Try without hardcoded chat format to let the model use its native template
                 self._model = Llama(
                     model_path=self.model_path,
                     verbose=False,
                     n_ctx=self.n_ctx,
-                    chat_format="chatml-function-calling",
+                    # chat_format="chatml-function-calling",  # Let model use its own format
                 )
             else:
                 chat_handler_class = getattr(llama_chat_format, self.chat_handler_class)
@@ -247,9 +250,12 @@ class GgufChatModel(llm.Model):
                 )
         return self._model
 
-    def execute(self, prompt, stream, response, conversation):
+    def build_messages(self, prompt, conversation):
+        """Build messages for the chat template with tool support"""
         messages = []
         current_system = None
+        
+        # Add conversation history
         if conversation is not None:
             for prev_response in conversation.responses:
                 if (
@@ -264,47 +270,165 @@ class GgufChatModel(llm.Model):
                     {"role": "user", "content": prev_response.prompt.prompt}
                 )
                 messages.append({"role": "assistant", "content": prev_response.text()})
+        
+        # Add current system message if needed
         if prompt.system and prompt.system != current_system:
             messages.append({"role": "system", "content": prompt.system})
-        messages.append({"role": "user", "content": prompt.prompt})
+        
+        # Add tool results from current prompt if any
+        if prompt.tool_results:
+            for tool_result in prompt.tool_results:
+                messages.append({
+                    "role": "tool",  # llama-cpp-python should handle role conversion
+                    "name": tool_result.name,
+                    "tool_call_id": tool_result.tool_call_id,
+                    "content": tool_result.output,
+                })
+        
+        # Add current user message (unless we're just adding tool results)
+        if not prompt.tool_results:
+            messages.append({"role": "user", "content": prompt.prompt})
+        
+        return messages
+
+    def _get_format_patterns(self, format_type="generic"):
+        """Get regex patterns based on detected format - simplified for gguf"""
+        patterns = {
+            "llama3x": [
+                # Llama 3.x simple format: {"name": "func", "parameters": {...}}
+                (r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{[^}]*\})\s*\}', 'llama3x'),
+            ],
+            "generic": [
+                # OpenAI format: {"tool_calls": [{"type": "function", "function": {"name": "func", "arguments": {...}}}]}
+                (r'\{\s*"tool_calls"\s*:\s*\[\s*\{\s*"type"\s*:\s*"function"\s*,\s*"function"\s*:\s*\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}\s*\}\s*\]\s*\}', 'openai'),
+                # Simple format fallback: {"name": "func", "parameters": {...}}
+                (r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{[^}]*\})\s*\}', 'simple'),
+                # Simple format with arguments: {"name": "func", "arguments": {...}}
+                (r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}', 'simple_args'),
+            ]
+        }
+        return patterns.get(format_type, patterns["generic"])
+
+    def _parse_tool_calls(self, text, available_tools, format_type="generic"):
+        """Parse tool calls using format-aware patterns"""
+        tool_calls = []
+        tool_names = [tool.name for tool in available_tools]
+        seen_calls = set()  # Track duplicates
+        
+        # Get patterns for the detected format
+        patterns = self._get_format_patterns(format_type)
+        
+        for pattern, fmt in patterns:
+            matches = re.findall(pattern, text, re.DOTALL | re.MULTILINE)
+            
+            for match in matches:
+                if len(match) >= 2:
+                    func_name, args_str = match[0], match[1]
+                    
+                    # Create a signature to avoid duplicates
+                    call_signature = f"{func_name}:{args_str.strip()}"
+                    if call_signature in seen_calls:
+                        continue
+                    
+                    if func_name in tool_names:
+                        try:
+                            # Parse arguments with better error handling
+                            if args_str.strip() in ['{}', '']:
+                                arguments = {}
+                            else:
+                                # Handle common JSON parsing issues
+                                args_str = args_str.strip()
+                                if not args_str.startswith('{'):
+                                    args_str = '{' + args_str
+                                if not args_str.endswith('}'):
+                                    args_str = args_str + '}'
+                                arguments = json.loads(args_str)
+                            
+                            tool_call = llm.ToolCall(
+                                name=func_name,
+                                arguments=arguments,
+                                tool_call_id=f"call_{len(tool_calls)}_{fmt}"
+                            )
+                            tool_calls.append(tool_call)
+                            seen_calls.add(call_signature)
+                            
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+        
+        return tool_calls
+
+    def execute(self, prompt, stream, response, conversation):
+        model = self.get_model()
+        messages = self.build_messages(prompt, conversation)
+        # Convert tools to the format expected by create_chat_completion
+        tools = None
+        if prompt.tools:
+            tools = []
+            for tool in prompt.tools:
+                tool_def = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.input_schema or {"type": "object", "properties": {}}
+                    }
+                }
+                tools.append(tool_def)
 
         if not stream:
-            model = self.get_model()
+            # Non-streaming execution
             completion = model.create_chat_completion(
                 messages=messages,
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "search_blog",
-                            "description": "Search for posts on the blog.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {
-                                        "type": "string",
-                                        "description": "Search query, keywords only",
-                                    }
-                                },
-                                "required": ["query"],
-                                "additionalProperties": False,
-                            },
-                        },
-                    }
-                ],
-                tool_choice="auto",
+                tools=tools,
+                tool_choice="auto" if tools else None,
             )
-            breakpoint()
-            return [completion["choices"][0]["text"]]
+            
+            choice = completion["choices"][0]
+            
+            # Handle tool calls if present in native format
+            if "tool_calls" in choice["message"] and choice["message"]["tool_calls"]:
+                for tool_call in choice["message"]["tool_calls"]:
+                    llm_tool_call = llm.ToolCall(
+                        name=tool_call["function"]["name"],
+                        arguments=json.loads(tool_call["function"]["arguments"]),
+                        tool_call_id=tool_call["id"]
+                    )
+                    response.add_tool_call(llm_tool_call)
+                return [choice["message"].get("content", "")]
+            else:
+                content = choice["message"]["content"]
+                # Try parsing tool calls from text if we have tools
+                if prompt.tools and content:
+                    tool_calls = self._parse_tool_calls(content, prompt.tools)
+                    if tool_calls:
+                        for tool_call in tool_calls:
+                            response.add_tool_call(tool_call)
+                return [content]
 
-        # Streaming
-        model = self.get_model()
-        completion = model.create_chat_completion(messages=messages, stream=True)
+        # Streaming execution
+        completion = model.create_chat_completion(messages=messages, tools=tools, tool_choice="auto" if tools else None, stream=True)
+        
+        generated_text = ""
+        
         for chunk in completion:
             choice = chunk["choices"][0]
-            delta_content = choice.get("delta", {}).get("content")
+            delta = choice.get("delta", {})
+            
+            # Handle regular content
+            delta_content = delta.get("content")
             if delta_content is not None:
+                generated_text += delta_content
                 yield delta_content
+        
+        # If we have tools, try parsing the text
+        if prompt.tools and generated_text:
+            tool_calls = self._parse_tool_calls(generated_text, prompt.tools)
+            if tool_calls:
+                for tool_call in tool_calls:
+                    response.add_tool_call(tool_call)
+
+                # Add some new lines to separate tool calls from the main text
+                yield "\n\n"
 
 
 class GgufEmbeddingModel(llm.EmbeddingModel):
